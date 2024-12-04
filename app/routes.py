@@ -25,7 +25,8 @@ from flask import (
 )
 
 
-from app.models import Player, Statistics, LeagueDashPlayerStats
+from app.models import Player, Statistics, LeagueDashPlayerStats, get_player_data
+from app.utils import get_todays_games_and_standings
 
 main = Blueprint("main", __name__)
 
@@ -37,16 +38,27 @@ def player_list():
     # Retrieve all players from the database
     return render_template("player_list.html", players=players)
 
+@main.route('/games')
+def games_dashboard():
+    """
+    Main dashboard to display today's games and other relevant info.
+    """
+    data = get_todays_games_and_standings()
+    standings = data['standings']
+    games = data['games']
+    print(data)
+    return render_template('games_dashboard.html', standings=standings, games = games)
 
-@main.route("/player/<int:player_id>")
+
+
+@main.route('/player/<int:player_id>')
 def player_detail(player_id):
-    """Display details for a specific player, including their statistics."""
-    player = Player.get_player(player_id)
-    if not player:
-        return redirect(url_for("main.player_list"))
-
-    stats = Statistics.get_stats_by_player(player_id)  # Retrieve player stats
-    return render_template("player_detail.html", player=player, stats=stats)
+    """
+    Route to display player details.
+    """
+    player_data = get_player_data(player_id)
+    print(player_data)
+    return render_template('player_detail.html', player_data=player_data, player_id=player_id)
 
 
 @main.route("/dashboard")

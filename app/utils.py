@@ -19,13 +19,26 @@ import time
 import logging
 from datetime import datetime
 from nba_api.stats.static import players, teams
+from pprint import pprint 
 from nba_api.stats.endpoints import (
     playercareerstats,
     commonteamroster,
     leaguedashplayerstats,
     commonplayerinfo,
+    defensehub,
+    commonallplayers,
+    PlayerGameLogs,
+    LeagueGameFinder,
+    ScoreboardV2
 )
-from app.models import Player, Statistics, Team, LeagueDashPlayerStats
+from app.models import (
+    Player, 
+    Statistics, 
+    Team, 
+    LeagueDashPlayerStats, 
+    PlayerGameLog, 
+    GameSchedule
+    )
 from db_config import get_connection
 
 # Configure logging
@@ -153,7 +166,7 @@ def fetch_and_store_player_stats(player_id):
     for attempt in range(retries):
         try:
             # Fetch player stats from NBA API
-            time.sleep(10)
+            time.sleep(2)
             career_stats = playercareerstats.PlayerCareerStats(
                 player_id=player_id, timeout=300
             )
@@ -201,7 +214,9 @@ def fetch_and_store_current_rosters():
         team_abbreviation = team["abbreviation"]
 
         # Create or retrieve the team in the database
-        team_obj = Team.add_team(name=team_name, abbreviation=team_abbreviation)
+        team_obj = Team.add_team(
+            team_id=team_id, name=team_name, abbreviation=team_abbreviation
+        )
         logger.info(
             "Added %s with ID: %s. Sleeping for 15 seconds.", team_name, team_id
         )
@@ -302,12 +317,18 @@ def age_parser(age):
 
 def fetch_and_store_all_players_stats():
     """Fetch stats for all active players."""
-    all_players = players.get_active_players()
-    logger.info("Fetched {len(all_players)} active players from NBA API.")
+    #all_players = players.get_active_players()
+    players = Player.get_all_players()
+    print(f"Found {len(players)} players in the database.")
 
-    for player in all_players:
-        fetch_and_store_player_stats(player["id"])
-    logger.info("All active player statistics have been successfully stored.")
+    # Process each player
+    for player in players:
+        player_id = player.player_id
+        print(f"Fetching Career Total Stats for player {player_id} ({player.name})...")
+        fetch_and_store_player_stats(player_id=player_id)
+    logger.info("Fetched {len(players)} active players from NBA API.")
+
+
 
 
 def fetch_and_store_leaguedashplayer_stats():
@@ -355,7 +376,7 @@ def fetch_and_store_leaguedashplayer_stats():
                 LeagueDashPlayerStats.add_stat(
                     player_id=player_id,
                     player_name=player_stat["PLAYER_NAME"],
-                    season=season_string,
+                    season =season_string,
                     team_id=player_stat["TEAM_ID"],
                     age=player_stat["AGE"],
                     gp=player_stat["GP"],
@@ -411,10 +432,276 @@ def fetch_and_store_leaguedashplayer_stats():
                     pfd_rank=player_stat["PFD_RANK"],
                     pts_rank=player_stat["PTS_RANK"],
                     plus_minus_rank=player_stat["PLUS_MINUS_RANK"],
-                    nba_fantasy_points_rank=(player_stat["NBA_FANTASY_PTS_RANK"]),
+                    nba_fantasy_points_rank=player_stat["NBA_FANTASY_PTS_RANK"],
                     dd2_rank=player_stat["DD2_RANK"],
-                    td3_rank=player_stat["TD3_RANK"],
-                )
+                    td3_rank=player_stat["TD3_RANK"]
+                    )
             logger.info("Stats for season %s stored successfully.", season_string)
         except Exception as e:
             logger.error("Error fetching stats for season %s: %s", season_string, e)
+
+
+def fetch_player_game_logs(player_ids, season):
+    """
+    Fetch game logs for players using the nba_api.
+
+    Args:
+        player_ids (list): List of player IDs.
+        season (str): Season string in the format "YYYY-YY" (e.g., "2023-24").
+    
+    Returns:
+        list: List of game log data for the players.
+    """
+    all_logs = []
+    
+    for player_id in player_ids:
+        try:
+            time.sleep(2)
+            response = PlayerGameLogs(player_id_nullable=player_id, season_nullable=season)
+            response_data = response.get_dict()
+
+            # Access the 'resultSets' key
+            result_sets = response_data.get('resultSets', [])
+            if not result_sets:
+                print(f"Warning: No resultSets in response for player {player_id}. Full response: {response_data}")
+                continue
+
+            # Extract rows and headers from the first result set
+            rows = result_sets[0].get('rowSet', [])
+            headers = result_sets[0].get('headers', [])
+            if not rows:
+                print(f"No rows found in response for player {player_id} in season {season}.")
+                continue
+
+            # Convert rows into dictionaries using headers
+            logs = [dict(zip(headers, row)) for row in rows]
+            print(f"Fetched {len(logs)} logs for player {player_id} in season {season}.")
+            all_logs.extend(logs)
+
+        except Exception as e:
+            print(f"Error fetching game logs for player {player_id}: {e}")
+    
+    return all_logs
+
+def fetch_and_store_schedule(season, team_ids):
+    """
+    Fetch and store the season game schedule for all teams.
+
+    Args:
+        season (str): Season string in "YYYY-YY" format (e.g., "2023-24").
+        team_ids (list): List of team IDs to fetch schedules for.
+    """
+    print(f"Fetching schedule for season {season}...")
+    all_games = []
+
+    # Fetch data using LeagueGameFinder
+    for team_id in team_ids:
+        try:
+            response = LeagueGameFinder(season_nullable=season, team_id_nullable=team_id)
+            response_data = response.get_dict()
+
+            if not response_data["resultSets"]:
+                continue
+
+            games = response_data["resultSets"][0]
+            headers = games["headers"]
+            rows = games["rowSet"]
+
+            for row in rows:
+                game = dict(zip(headers, row))
+                opponent_abbreviation = game["MATCHUP"].split()[-1]
+                opponent_team_id = Team.get_team_id_by_abbreviation(opponent_abbreviation)
+
+                if opponent_team_id is None:
+                    print(f"Warning: Could not find team_id for abbreviation {opponent_abbreviation}. Skipping game.")
+                    continue
+
+                # Calculate opponent score
+                team_score = game.get("PTS")
+                plus_minus = game.get("PLUS_MINUS")
+                if team_score is not None and plus_minus is not None:
+                    opponent_score = team_score - plus_minus if game.get("WL") == "W" else team_score + plus_minus
+                else:
+                    opponent_score = None
+
+                all_games.append({
+                    "game_id": game["GAME_ID"],
+                    "season": season,
+                    "team_id": game["TEAM_ID"],
+                    "opponent_team_id": opponent_team_id,
+                    "game_date": game["GAME_DATE"],
+                    "home_or_away": "H" if "vs." in game["MATCHUP"] else "A",
+                    "result": game.get("WL"),
+                    "score": f"{team_score} - {opponent_score}" if team_score and opponent_score else None
+                })
+        except Exception as e:
+            print(f"Error fetching games for team {team_id}: {e}")
+
+    # Insert games into the database
+    GameSchedule.insert_game_schedule(all_games)
+    print(f"Inserted {len(all_games)} games into the database.")
+
+
+
+def populate_schedule(season="2024-25"):
+    """
+    Populate the game schedule for the specified season.
+    """
+    GameSchedule.create_table()
+    teams = Team.get_all_teams()  # Add a method to fetch all teams
+    team_ids = [team.team_id for team in teams]
+
+    fetch_and_store_schedule(season, team_ids)
+
+    
+def get_todays_games_and_standings():
+    """
+    Fetch today's games, conference standings, and other data from the NBA API.
+
+    Returns:
+        dict: A dictionary containing today's games, standings, and game details.
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    try:
+        # Fetch scoreboard data
+        scoreboard = ScoreboardV2(game_date=today)
+        debug_standings(scoreboard)
+        # Process conference standings
+        standings = {}
+        for conf, data_obj in [("East", scoreboard.east_conf_standings_by_day), ("West", scoreboard.west_conf_standings_by_day)]:
+            standings_data = data_obj.get_dict()
+            standings_headers = standings_data["headers"]
+            standings_rows = standings_data["data"]
+            standings[conf] = [dict(zip(standings_headers, row)) for row in standings_rows]
+
+        # Process games
+        games_data = scoreboard.game_header.get_dict()
+        game_headers = games_data["headers"]
+        game_rows = games_data["data"]
+        games = []
+
+        # Fetch LineScore and LastMeeting data
+        line_score_data = scoreboard.line_score.get_dict()
+        line_headers = line_score_data["headers"]
+        line_rows = line_score_data["data"]
+        line_scores = [dict(zip(line_headers, row)) for row in line_rows]
+
+        last_meeting_data = scoreboard.last_meeting.get_dict()
+        last_headers = last_meeting_data["headers"]
+        last_rows = last_meeting_data["data"]
+        last_meetings = {row[0]: dict(zip(last_headers, row)) for row in last_rows}  # Map by GAME_ID
+
+        for row in game_rows:
+            game = dict(zip(game_headers, row))
+            home_team = Team.get_team(game["HOME_TEAM_ID"])
+            away_team = Team.get_team(game["VISITOR_TEAM_ID"])
+
+            # Format game details
+            games.append({
+                "game_id": game["GAME_ID"],
+                "home_team": home_team.name or "Unknown",
+                "away_team": away_team.name or "Unknown",
+                "game_time": game["GAME_STATUS_TEXT"],  # e.g., "7:30 pm ET"
+                "arena": game.get("ARENA_NAME", "Unknown Arena"),  # Arena name
+                "line_score": [
+                    {
+                        "team_name": ls["TEAM_NAME"],
+                        "pts": ls["PTS"],
+                        "fg_pct": ls["FG_PCT"],
+                        "ft_pct": ls["FT_PCT"],
+                        "fg3_pct": ls["FG3_PCT"],
+                        "ast": ls["AST"],
+                        "reb": ls["REB"],
+                        "tov": ls["TOV"]
+                    }
+                    for ls in line_scores if ls["GAME_ID"] == game["GAME_ID"]
+                ],
+                "last_meeting": {
+                    "date": last_meetings.get(game["GAME_ID"], {}).get("LAST_GAME_DATE_EST"),
+                    "home_team": last_meetings.get(game["GAME_ID"], {}).get("LAST_GAME_HOME_TEAM_NAME"),
+                    "home_points": last_meetings.get(game["GAME_ID"], {}).get("LAST_GAME_HOME_TEAM_POINTS"),
+                    "visitor_team": last_meetings.get(game["GAME_ID"], {}).get("LAST_GAME_VISITOR_TEAM_NAME"),
+                    "visitor_points": last_meetings.get(game["GAME_ID"], {}).get("LAST_GAME_VISITOR_TEAM_POINTS")
+                }
+            })
+
+        return {
+            "standings": standings,
+            "games": games
+        }
+
+    except Exception as e:
+        print(f"Error fetching today's games and standings: {e}")
+        return {"standings": {}, "games": []}
+
+
+def debug_standings(scoreboard):
+    """
+    Debug and print standings data from the scoreboard.
+    """
+    print("East Conference Standings Data:")
+    pprint(scoreboard.east_conf_standings_by_day.get_dict())
+    print("\nWest Conference Standings Data:")
+    pprint(scoreboard.west_conf_standings_by_day.get_dict())
+
+def get_recent_seasons():
+    """
+    Determine the range of recent seasons to fetch data for.
+    
+    Returns:
+        list: List of season start years (e.g., [2018, 2019, 2020, 2021, 2022]).
+    """
+    current_year = datetime.now().year
+    return [current_year - i for i in range(5)]
+
+
+def get_game_logs_for_player(player_id, season):
+    """
+    Fetch and insert game logs for a specific player and season.
+    
+    Args:
+        player_id (str): The player's ID.
+        season (str): Season string in the format "YYYY-YY" (e.g., "2023-24").
+    """
+    print(f"Fetching game logs for player: {player_id} and season: {season}")
+
+    # Fetch game logs for the player
+    player_game_logs = fetch_player_game_logs([player_id], season)
+
+    # Debug statement to inspect returned data
+    if player_game_logs:
+        print(f"Retrieved {len(player_game_logs)} game logs for player {player_id}.")
+    else:
+        print(f"No game logs retrieved for player {player_id} in season {season}.")
+        return
+
+    # Insert logs into the database
+    print(f"Inserting game logs for player {player_id}...")
+    PlayerGameLog.insert_game_logs(player_game_logs)
+    print(f"Successfully inserted logs for player {player_id}.")
+
+def get_game_logs_for_all_players():
+    """
+    Fetch and insert game logs for all players in the database for recent seasons.
+    """
+    # Ensure the gamelogs table exists
+    PlayerGameLog.create_table()
+
+    # Fetch all players from the database
+    players = Player.get_all_players()
+    print(f"Found {len(players)} players in the database.")
+
+    # Process each player
+    for player in players:
+        player_id = player.player_id
+        print(f"Processing game logs for player {player_id} ({player.name})...")
+
+        for season in get_recent_seasons():
+            season_str = f"{season}-{str(season + 1)[-2:]}"
+            print(f"  Fetching logs for season {season_str}...")
+            player_game_logs = fetch_player_game_logs([player_id], season_str)
+            if player_game_logs:
+                print(f"  Inserting {len(player_game_logs)} logs for player {player_id} in season {season_str}.")
+                PlayerGameLog.insert_game_logs(player_game_logs)
+            else:
+                print(f"  No logs found for player {player_id} in season {season_str}.")
